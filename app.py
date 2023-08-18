@@ -1,94 +1,151 @@
 import openai
 import pandas as pd
-import re
 from datetime import datetime
 import backoff
 from tqdm import tqdm
 import os
 from dotenv import load_dotenv
+import nltk
+from nltk.tokenize import sent_tokenize
+
 
 load_dotenv()
 api_key = os.getenv("API_KEY")
 openai.api_key = api_key
 
 
-input_file_name = "03152023.xlsx"
-df = pd.read_excel(input_file_name)
-list_of_dict = df.to_dict("records")
+def read_excel_to_dicts(input_file_name):
+    df = pd.read_excel(input_file_name)
+    required_columns = ["ASIN", "item_name.value"]
+
+    if all(col in df.columns for col in required_columns):
+        return df.to_dict("records")
+    else:
+        raise Exception("Missing columns!")
 
 
-def slice_list(list):
-    ## we need to slice our list and send it in chunks, in order to avoid hitting length limits and getting messed up responses
-    slice_size = 3
-    slices = [list[i : i + slice_size] for i in range(0, len(list), slice_size)]
-    return slices
+def slice_list(lst, slice_size):
+    return [lst[i : i + slice_size] for i in range(0, len(lst), slice_size)]
 
 
-queries = []
-ids = []
+def create_queries_and_payloads(data_list):
+    context = "You are an assistant that receives product titles and creates product description which are 6 sentences long and written in Polish."
+    queries = []
+    ids = []
 
-
-def getTitles(list):
-    search_phrase = "Product description for minimum of 6 sentences in Polish for:"
-    for item in list:
+    for item in data_list:
         item_id = item["ASIN"]
         item_name = item["item_name.value"]
         ids.append(item_id)
-        queries.append(f"{search_phrase} {item_name}")
+        queries.append({"role": "system", "content": context})
+        queries.append({"role": "user", "content": item_name})
+
+    return queries, ids
 
 
-getTitles(list_of_dict)
+def get_product_description(payloads):
+    responses = []
 
-payloads = slice_list(queries)
-
-response_arr = []
-
-
-def getProdDescription():
-    for element in tqdm(payloads):
+    for element in tqdm(payloads, desc="getting GPT responses"):
         response = completions_with_backoff(
-            model="text-davinci-003",
-            prompt=element,
-            temperature=0.8,
-            max_tokens=2000,
-            top_p=1.0,
-            frequency_penalty=0.8,
-            presence_penalty=0,
+            model="gpt-3.5-turbo",
+            messages=element,
+            temperature=0.2,
+            max_tokens=500,
+            frequency_penalty=1.2,
+            presence_penalty=1.1,
         )
-        response_arr.append(response)
+        responses.append(response["choices"][0]["message"]["content"])
+
+    return responses
 
 
 @backoff.on_exception(backoff.expo, openai.error.RateLimitError)
 def completions_with_backoff(**kwargs):
-    return openai.Completion.create(**kwargs)
+    return openai.ChatCompletion.create(**kwargs)
 
 
-getProdDescription()
+def merge(ids_arr, responses_arr):
+    id_column_name = "ASIN"
+    response_column_name = "rtip_product_description.value"
+    responses_with_ids = [
+        {id_column_name: k, response_column_name: v}
+        for k, v in zip(ids_arr, responses_arr)
+    ]
+    return responses_with_ids
 
-choices_list = []
 
-for element in response_arr:
-    dict(element)
-    choices = element["choices"]
-    choices_list.append(choices)
+def split_text(text):
+    lang = "polish"
+    return sent_tokenize(text, lang)
 
-text_array = []
 
-for i in choices_list:
-    for j in i:
-        clean = j["text"]
-        text_array.append(re.sub("\n", "", clean))
+def process_result(arr):
+    result = []
 
-id_column_name = "ASIN"
-response_column_name = "rtip_product_description.value"
+    for element in arr:
+        text = element["rtip_product_description.value"]
+        tokenize = split_text(text)
 
-result = [{id_column_name: k, response_column_name: v} for k, v in zip(ids, text_array)]
+        desc = " ".join(tokenize[:3]) if len(tokenize) >= 6 else "no data"
+        blt = (
+            [point.rstrip(".!?") for point in tokenize[3:]]
+            if len(tokenize) >= 6
+            else []
+        )
 
-now = datetime.now()
-currentTime = now.strftime("%H_%M_%S")
+        bullet_points = {
+            f"bullet_point#{i+1}.value": point if point else "no data"
+            for i, point in enumerate(blt[:10])
+        }
+        bullet_points.update(
+            {f"bullet_point#{i+1}.value": "NULL" for i in range(len(blt), 10)}
+        )
 
-res = pd.DataFrame(result)
+        result.append(
+            {
+                "ASIN": element["ASIN"],
+                "sc_vendor_name": "AmazonPl/NM5V9",
+                "rtip_product_description.value": desc,
+                **bullet_points,
+            }
+        )
 
-output_filename = "products description"
+    return result
 
-res.to_excel(f"{output_filename} - {currentTime}.xlsx", index=False)
+
+def create_file(user_name, data):
+    pd.io.formats.excel.ExcelFormatter.header_style = None
+    now = datetime.now()
+    current_date = now.strftime("%m%d%Y")
+
+    file = f"FLEX_ATTRPDB {current_date}_{user_name}.xlsx"
+    writer = pd.ExcelWriter(file, engine="xlsxwriter")
+    data.to_excel(writer, sheet_name="LPD", index=False, startrow=1)
+    worksheet = writer.sheets["LPD"]
+    worksheet.write_string(0, 0, "version=1.0.0")
+    writer.save()
+
+
+def main():
+    input_file_name = "new_model_test.xlsx"
+    user_name = "krolikma"
+
+    list_of_dicts = read_excel_to_dicts(input_file_name)
+    queries, ids = create_queries_and_payloads(list_of_dicts)
+
+    slice_size = 2
+    payloads = slice_list(queries, slice_size)
+
+    responses = get_product_description(payloads)
+    responses_with_ids = merge(ids, responses)
+
+    nltk.download("punkt")
+
+    result = process_result(responses_with_ids)
+    output = pd.DataFrame(result)
+
+    create_file(user_name, output)
+
+
+main()
